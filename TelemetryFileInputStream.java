@@ -77,15 +77,31 @@ public class TelemetryFileInputStream extends FileInputStream {
     // it changed we would end up double-counting!
     //
     public int read(byte[] b) throws IOException {
-        int result = super.read(b);
-        t.addObservation(result);
+        int result;
+
+        t.readPending();
+        try {
+            result = super.read(b);
+            t.addObservation(result);
+        } finally {
+            t.readComplete();
+        }
+
         return result;
     }
 
 
     public int read(byte[] b, int off, int len) throws IOException {
-        int result = super.read(b, off, len);
-        t.addObservation(result);
+        int result;
+
+        t.readPending();
+        try {
+            result = super.read(b, off, len);
+            t.addObservation(result);
+        } finally {
+            t.readComplete();
+        }
+
         return result;
     }
 
@@ -105,7 +121,8 @@ public class TelemetryFileInputStream extends FileInputStream {
         private long[] observations;
 
         private AtomicLong lastReportTime = new AtomicLong(NO_REPORT_YET);
-        private AtomicReference<long[]> lastReport = new AtomicReference<>();
+        private AtomicLong readsPending = new AtomicLong(0);
+        private AtomicReference<TelemetryReport> lastReport = new AtomicReference<>();
         private Semaphore reportReadySemaphore = new Semaphore(0);
 
 
@@ -124,6 +141,14 @@ public class TelemetryFileInputStream extends FileInputStream {
             Thread report = new Thread(() -> { runReportLoop(); });
             report.setDaemon(true);
             report.start();
+        }
+
+        public void readPending() {
+            readsPending.incrementAndGet();
+        }
+
+        public void readComplete() {
+            readsPending.decrementAndGet();
         }
 
         // Log a single observation and get out of the way as quickly as we can.
@@ -145,8 +170,7 @@ public class TelemetryFileInputStream extends FileInputStream {
         // since it holds up observations being written while running.
         private void runAggregationLoop() {
             int currentTimestep = -1;
-
-            long[] report = new long[timestepsPerReport];
+            TelemetryReport report = new TelemetryReport(timestepsPerReport);
 
             while (true) {
                 currentTimestep++;
@@ -162,35 +186,29 @@ public class TelemetryFileInputStream extends FileInputStream {
                         System.err.println("WARNING: overflowed circular buffer.  Skipping this set of observations");
                         overflowed = false;
 
-                        report[currentTimestep] = -1;
-                        continue;
-                    }
+                        report.observationSums[currentTimestep] = -1;
+                        report.readsPendingCounts[currentTimestep] = -1;
+                    } else {
+                        report.readsPendingCounts[currentTimestep] = readsPending.get();
+                        report.readsCompletedCount += lastWritePos + 1;
 
-                    long total = 0;
-
-                    for (int i = 0; i <= lastWritePos; i++) {
-                        total += observations[i];
-                    }
-
-                    // The next timestep will write at 0
-                    lastWritePos = -1;
-
-                    report[currentTimestep] = total;
-
-                    // Publish our report for the last `reportPeriod` if
-                    // we've got a full set.
-                    if (currentTimestep + 1 == timestepsPerReport) {
-                        long[] snapshot = new long[timestepsPerReport];
-
-                        for (int i = 0; i < timestepsPerReport; i++) {
-                            snapshot[i] = report[i];
+                        for (int i = 0; i <= lastWritePos; i++) {
+                            report.observationSums[currentTimestep] += observations[i];
                         }
 
-                        lastReport.set(snapshot);
+                        // The next timestep will write at 0
+                        lastWritePos = -1;
+                    }
+
+                    // Publish our report for the last `reportPeriod` if we've
+                    // got a full set.
+                    if (currentTimestep + 1 == timestepsPerReport) {
+                        lastReport.set(report);
                         lastReportTime.set(System.currentTimeMillis());
                         reportReadySemaphore.release();
 
                         currentTimestep = -1;
+                        report = new TelemetryReport(timestepsPerReport);
                     }
                 }
             }
@@ -209,53 +227,93 @@ public class TelemetryFileInputStream extends FileInputStream {
                 }
 
                 if (lastSeenReportTime != lastReportTime.get()) {
-                    long[] report = lastReport.get();
+                    TelemetryReport report = lastReport.get();
                     long now = lastReportTime.get();
 
-                    long minimum = Long.MAX_VALUE;
-                    long maximum = Long.MIN_VALUE;
-                    long total = 0;
+                    long minimumTransfer = Long.MAX_VALUE;
+                    long maximumTransfer = Long.MIN_VALUE;
+                    long totalTransfer = 0;
+
+                    long minimumPending = Long.MAX_VALUE;
+                    long maximumPending = Long.MIN_VALUE;
+                    long totalPending = 0;
 
                     int validTimestepCount = 0;
 
                     for (int i = 0; i < timestepsPerReport; i++) {
-                        if (report[i] < 0) {
+                        if (report.observationSums[i] < 0) {
                             continue;
                         }
 
                         validTimestepCount += 1;
 
-                        if (report[i] < minimum) {
-                            minimum = report[i];
+                        if (report.observationSums[i] < minimumTransfer) {
+                            minimumTransfer = report.observationSums[i];
                         }
 
-                        if (report[i] > maximum) {
-                            maximum = report[i];
+                        if (report.observationSums[i] > maximumTransfer) {
+                            maximumTransfer = report.observationSums[i];
                         }
 
-                        total += report[i];
+                        totalTransfer += report.observationSums[i];
+
+                        if (report.readsPendingCounts[i] < minimumPending) {
+                            minimumPending = report.readsPendingCounts[i];
+                        }
+
+                        if (report.readsPendingCounts[i] > maximumPending) {
+                            maximumPending = report.readsPendingCounts[i];
+                        }
+
+                        totalPending += report.readsPendingCounts[i];
                     }
 
                     StringBuilder sb = new StringBuilder();
 
-                    if (minimum != Long.MAX_VALUE) {
-                        sb.append(String.format("minimum=%.2f KB/s", (minimum / (timestepPeriod / 1000.0) / 1024.0)));
+                    if (minimumTransfer != Long.MAX_VALUE) {
+                        sb.append(String.format("minimum xfr=%.2f KB/s", (minimumTransfer / (timestepPeriod / 1000.0) / 1024.0)));
                     }
-                    if (maximum != Long.MIN_VALUE) {
+                    if (maximumTransfer != Long.MIN_VALUE) {
                         if (sb.length() > 0) { sb.append("; "); }
-                        sb.append(String.format("maximum=%.2f KB/s", (maximum / (timestepPeriod / 1000.0) / 1024.0)));
+                        sb.append(String.format("maximum xfr=%.2f KB/s", (maximumTransfer / (timestepPeriod / 1000.0) / 1024.0)));
                     }
                     if (validTimestepCount > 0) {
                         if (sb.length() > 0) { sb.append("; "); }
-                        sb.append(String.format("average=%.2f KB/s", (total / validTimestepCount / (timestepPeriod / 1000.0) / 1024.0)));
+                        sb.append(String.format("average xfr=%.2f KB/s", (totalTransfer / validTimestepCount / (timestepPeriod / 1000.0) / 1024.0)));
+                    }
+
+                    if (minimumPending != Long.MAX_VALUE) {
+                        if (sb.length() > 0) { sb.append("; "); }
+                        sb.append(String.format("minimum pending=%d", minimumPending));
+                    }
+                    if (maximumPending != Long.MIN_VALUE) {
+                        if (sb.length() > 0) { sb.append("; "); }
+                        sb.append(String.format("maximum pending=%d", maximumPending));
+                    }
+                    if (validTimestepCount > 0) {
+                        if (sb.length() > 0) { sb.append("; "); }
+                        sb.append(String.format("average pending=%.2f", ((float)totalPending / validTimestepCount)));
                     }
 
                     if (sb.length() > 0) {
+                        sb.append("; reads_completed=" + report.readsCompletedCount);
                         System.err.println(now + " " + sb.toString());
                     }
 
                     lastSeenReportTime = now;
                 }
+            }
+        }
+
+
+        private static class TelemetryReport {
+            public long[] observationSums;
+            public long[] readsPendingCounts;
+            public long readsCompletedCount;
+
+            public TelemetryReport(int timestepsPerReport) {
+                observationSums = new long[timestepsPerReport];
+                readsPendingCounts = new long[timestepsPerReport];
             }
         }
     }
